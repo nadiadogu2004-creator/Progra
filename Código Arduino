@@ -15,7 +15,7 @@ float prev = 0;
 float filtered = 0;
 
 // Detección
-float threshold = 8.0;   // 🔥 AJUSTAR
+float threshold = 8.0;   //  AJUSTAR
 bool wasBelow = true;
 
 // BPM
@@ -46,10 +46,10 @@ void loop() {
   // Centrar señal
   ecg = raw - 512;
 
-  // 🔬 FILTRO SIMPLE (suaviza)
+  //  FILTRO SIMPLE (suaviza)
   filtered = 0.9 * filtered + 0.1 * ecg;
 
-  // 🔥 DETECCIÓN DE LATIDO (QRS)
+  //  DETECCIÓN DE LATIDO (QRS)
   if (filtered > threshold && wasBelow && (millis() - lastBeat > 300)) {
 
     unsigned long now = millis();
