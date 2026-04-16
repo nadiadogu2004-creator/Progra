@@ -1,0 +1,82 @@
+#define ECG_PIN A0
+#define LO_PLUS 10
+#define LO_MINUS 11
+
+// Tiempo de muestreo (~200 Hz)
+const unsigned long SAMPLE_US = 5000;
+unsigned long lastSample = 0;
+
+// Variables señal
+float raw = 0;
+float ecg = 0;
+
+// Filtro
+float prev = 0;
+float filtered = 0;
+
+// Detección
+float threshold = 8.0;   // 🔥 AJUSTAR
+bool wasBelow = true;
+
+// BPM
+unsigned long lastBeat = 0;
+float bpm = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LO_PLUS, INPUT);
+  pinMode(LO_MINUS, INPUT);
+}
+
+void loop() {
+
+  // Control de frecuencia (MUY IMPORTANTE)
+  if (micros() - lastSample < SAMPLE_US) return;
+  lastSample += SAMPLE_US;
+
+  // Verifica electrodos
+  if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
+    Serial.println("0,0,NO_CONTACT");
+    return;
+  }
+
+  // Lectura
+  raw = analogRead(ECG_PIN);
+
+  // Centrar señal
+  ecg = raw - 512;
+
+  // 🔬 FILTRO SIMPLE (suaviza)
+  filtered = 0.9 * filtered + 0.1 * ecg;
+
+  // 🔥 DETECCIÓN DE LATIDO (QRS)
+  if (filtered > threshold && wasBelow && (millis() - lastBeat > 300)) {
+
+    unsigned long now = millis();
+    int RR = now - lastBeat;
+    lastBeat = now;
+
+    if (RR > 0) {
+      bpm = 60000.0 / RR;
+    }
+
+    wasBelow = false;
+
+    Serial.print(filtered);
+    Serial.print(",");
+    Serial.print(bpm);
+    Serial.println(",LATIDO");
+
+  } else {
+
+    Serial.print(filtered);
+    Serial.print(",");
+    Serial.print(bpm);
+    Serial.println(",OK");
+  }
+
+  // Reset detección
+  if (filtered < threshold) {
+    wasBelow = true;
+  }
+}
