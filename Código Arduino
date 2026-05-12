@@ -1,82 +1,504 @@
-#define ECG_PIN A0
-#define LO_PLUS 10
-#define LO_MINUS 11
+import processing.serial.*;
+import java.util.*;
 
-// Tiempo de muestreo (~200 Hz)
-const unsigned long SAMPLE_US = 5000;
-unsigned long lastSample = 0;
+// ─── SERIAL ───────────────────────────────────────────────────────────
+Serial myPort;
+LinkedList<Float> buffer = new LinkedList<Float>();
+PrintWriter writer;
 
-// Variables señal
-float raw = 0;
-float ecg = 0;
-
-// Filtro
-float prev = 0;
+// ─── SEÑAL ────────────────────────────────────────────────────────────
+float smooth   = 0;
 float filtered = 0;
+float gain     = 1.5;
+float offsetY  = 0;
 
-// Detección
-float threshold = 8.0;   //  AJUSTAR
-bool wasBelow = true;
+// ─── DETECCIÓN DE PICOS R ─────────────────────────────────────────────
+float prev = 0, prev2 = 0;
+float threshold  = 8.0;
+int   lastBeat   = 0;
+int   flashTimer = 0;
 
-// BPM
-unsigned long lastBeat = 0;
-float bpm = 0;
+// ─── HRV / BPM ────────────────────────────────────────────────────────
+ArrayList<Integer> rrList = new ArrayList<Integer>();
+float bpm = 0, bpmSmooth = 0;
+float sdnn  = 0;
+float rmssd = 0;
+int   beatCount = 0;
 
+// ─── DETECCIÓN DE ONDAS ───────────────────────────────────────────────
+float peakAmplitude  = 0;   // amplitud del último pico R
+float pWaveEst       = 0;   // estimación onda P (zona pre-QRS)
+boolean showWaveLabel = false;
+int waveLabelTimer   = 0;
+
+// ─── DIAGNÓSTICO ──────────────────────────────────────────────────────
+String diagnosis    = "Analizando...";
+String hrvStatus    = "Calculando HRV...";
+String rhythmStatus = "Ritmo: --";
+color  diagColor    = color(0, 200, 100);
+
+// ─── LAYOUT ───────────────────────────────────────────────────────────
+int   panelW;
+int   panelH;
+int   stripCount = 4;
+float[] ecgBuffer;
+int   bufferSize;
+int   writeHead = 0;
+int   samplesPerStrip;
+
+int   gridSmall = 5;
+int   gridLarge = 25;
+float mmPerPx   = 0.2;
+
+// ─── COLORES ──────────────────────────────────────────────────────────
+color COL_BG       = color(0, 10, 0);
+color COL_GRID_S   = color(0, 50, 0);
+color COL_GRID_L   = color(0, 90, 0);
+color COL_SIGNAL   = color(0, 255, 80);
+color COL_PANEL_BG = color(0, 15, 0);
+color COL_ACCENT   = color(0, 220, 80);
+color COL_DIM      = color(0, 120, 40);
+color COL_WARN     = color(255, 160, 0);
+color COL_DANGER   = color(255, 50, 50);
+color COL_HEART    = color(255, 60, 60);
+color COL_WAVE_P   = color(100, 255, 200);
+color COL_WAVE_Q   = color(255, 255, 100);
+color COL_WAVE_T   = color(100, 200, 255);
+
+PFont fontMono;
+PFont fontBig;
+PFont fontSmall;
+
+// ─── SETUP ────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  pinMode(LO_PLUS, INPUT);
-  pinMode(LO_MINUS, INPUT);
+  fullScreen();
+  background(COL_BG);
+
+  fontMono  = createFont("Courier New", 13, true);
+  fontBig   = createFont("Courier New Bold", 72, true);
+  fontSmall = createFont("Courier New", 11, true);
+
+  panelW          = int(width * 0.74);
+  samplesPerStrip = panelW;
+  bufferSize      = samplesPerStrip * stripCount;
+  ecgBuffer       = new float[bufferSize];
+  for (int i = 0; i < bufferSize; i++) ecgBuffer[i] = 0;
+  panelH = height / stripCount;
+
+  println("Puertos disponibles:");
+  printArray(Serial.list());
+  if (Serial.list().length > 0) {
+    myPort = new Serial(this, Serial.list()[0], 115200);
+    myPort.bufferUntil('\n');
+  }
+
+  writer = createWriter("ecg_data.csv");
+  writer.println("tiempo_ms,valor,bpm,sdnn,rmssd");
 }
 
-void loop() {
-
-  // Control de frecuencia (MUY IMPORTANTE)
-  if (micros() - lastSample < SAMPLE_US) return;
-  lastSample += SAMPLE_US;
-
-  // Verifica electrodos
-  if (digitalRead(LO_PLUS) || digitalRead(LO_MINUS)) {
-    Serial.println("0,0,NO_CONTACT");
-    return;
+// ─── DRAW ─────────────────────────────────────────────────────────────
+void draw() {
+  while (!buffer.isEmpty()) {
+    float v = buffer.removeFirst();
+    processSignal(v);
   }
 
-  // Lectura
-  raw = analogRead(ECG_PIN);
+  background(COL_BG);
+  drawGrid();
+  drawSignalStrips();
+  drawSweepLine();
+  drawRightPanel();
+  drawTopBar();
+  drawHeartFlash();
+}
 
-  // Centrar señal
-  ecg = raw - 512;
+// ─── PROCESAR SEÑAL ───────────────────────────────────────────────────
+void processSignal(float raw) {
+  smooth   = 0.85 * smooth + 0.15 * raw;
+  filtered = smooth;
 
-  //  FILTRO SIMPLE (suaviza)
-  filtered = 0.9 * filtered + 0.1 * ecg;
+  ecgBuffer[writeHead] = filtered;
+  writeHead = (writeHead + 1) % bufferSize;
 
-  //  DETECCIÓN DE LATIDO (QRS)
-  if (filtered > threshold && wasBelow && (millis() - lastBeat > 300)) {
+  writer.println(millis() + "," + nf(filtered,1,4) + "," +
+                 nf(bpmSmooth,1,1) + "," + nf(sdnn,1,1) + "," + nf(rmssd,1,1));
 
-    unsigned long now = millis();
-    int RR = now - lastBeat;
+  detectPeak(abs(filtered));
+}
+
+// ─── DETECCIÓN PICO R ─────────────────────────────────────────────────
+void detectPeak(float v) {
+  int now = millis();
+  boolean isPeak = (prev > prev2) && (prev > v) && (prev > threshold);
+
+  if (isPeak && (now - lastBeat) > 500) {
+    if (lastBeat > 0) {
+      int rr = now - lastBeat;
+      // Rango fisiológico estricto: 50–120 bpm → 500ms–1200ms
+      if (rr > 500 && rr < 1200) {
+        rrList.add(rr);
+        if (rrList.size() > 30) rrList.remove(0);
+
+        bpm           = 60000.0 / rr;
+        bpmSmooth     = 0.8 * bpmSmooth + 0.2 * bpm;
+        peakAmplitude = prev;
+        beatCount++;
+
+        calcHRV();
+        updateDiagnosis();
+        flashTimer    = 8;
+        waveLabelTimer = 30;
+      }
+    }
     lastBeat = now;
+  }
+  prev2 = prev;
+  prev  = v;
+}
 
-    if (RR > 0) {
-      bpm = 60000.0 / RR;
+// ─── CÁLCULO HRV ──────────────────────────────────────────────────────
+void calcHRV() {
+  if (rrList.size() < 5) return;
+
+  // SDNN
+  float mean = 0;
+  for (int rr : rrList) mean += rr;
+  mean /= rrList.size();
+
+  float sumSq = 0;
+  for (int rr : rrList) sumSq += (rr - mean) * (rr - mean);
+  sdnn = sqrt(sumSq / rrList.size());
+
+  // RMSSD
+  float sumDiffSq = 0;
+  for (int i = 1; i < rrList.size(); i++) {
+    float diff = rrList.get(i) - rrList.get(i-1);
+    sumDiffSq += diff * diff;
+  }
+  rmssd = sqrt(sumDiffSq / (rrList.size() - 1));
+
+  // Clamp para evitar valores irreales
+  sdnn  = constrain(sdnn,  0, 200);
+  rmssd = constrain(rmssd, 0, 200);
+
+  if      (sdnn < 20)  hrvStatus = "HRV BAJA  - Posible estres";
+  else if (sdnn > 100) hrvStatus = "HRV ALTA  - Buena regulacion";
+  else                 hrvStatus = "HRV NORMAL";
+}
+
+// ─── DIAGNÓSTICO ──────────────────────────────────────────────────────
+void updateDiagnosis() {
+  int bpmInt = int(bpmSmooth);
+
+  if      (bpmInt < 50)  { rhythmStatus = "BRADICARDIA SEVERA"; diagColor = COL_DANGER; }
+  else if (bpmInt < 60)  { rhythmStatus = "BRADICARDIA";        diagColor = COL_WARN;   }
+  else if (bpmInt > 150) { rhythmStatus = "TAQUICARDIA SEVERA"; diagColor = COL_DANGER; }
+  else if (bpmInt > 100) { rhythmStatus = "TAQUICARDIA";        diagColor = COL_WARN;   }
+  else                   { rhythmStatus = "RITMO SINUSAL";      diagColor = COL_ACCENT; }
+
+  if (rrList.size() >= 8) {
+    float maxRR = 0, minRR = 9999;
+    for (int rr : rrList) {
+      if (rr > maxRR) maxRR = rr;
+      if (rr < minRR) minRR = rr;
+    }
+    float variabilidad = (maxRR - minRR) / minRR;
+
+    // Umbral más estricto para evitar falsos positivos
+    if (variabilidad > 0.35) {
+      diagnosis = "POSIBLE ARRITMIA";
+      diagColor = COL_DANGER;
+    } else if (sdnn > 80 && rmssd > 50) {
+      diagnosis = "HRV ELEVADA";
+      diagColor = COL_WARN;
+    } else if (sdnn < 20 && rrList.size() >= 10) {
+      // HRV muy baja — marcador TDAH
+      diagnosis = "HRV BAJA - TDAH?";
+      diagColor = COL_WARN;
+    } else {
+      diagnosis = "ECG NORMAL";
+      diagColor = COL_ACCENT;
+    }
+  }
+}
+
+// ─── CUADRÍCULA ───────────────────────────────────────────────────────
+void drawGrid() {
+  noFill();
+
+  stroke(COL_GRID_S);
+  strokeWeight(0.5);
+  for (int x = 0; x < panelW; x += gridSmall) line(x, 0, x, height);
+  for (int y = 0; y < height; y += gridSmall) line(0, y, panelW, y);
+
+  stroke(COL_GRID_L);
+  strokeWeight(1);
+  for (int x = 0; x < panelW; x += gridLarge) line(x, 0, x, height);
+  for (int y = 0; y < height; y += gridLarge) line(0, y, panelW, y);
+
+  stroke(0, 140, 40);
+  strokeWeight(1.5);
+  for (int i = 1; i < stripCount; i++) line(0, i * panelH, panelW, i * panelH);
+}
+
+// ─── FRANJAS DE SEÑAL ─────────────────────────────────────────────────
+void drawSignalStrips() {
+  float ampScale = (panelH / 2 - 20) * gain / 150.0;
+
+  for (int strip = 0; strip < stripCount; strip++) {
+    int stripStartY = strip * panelH;
+    int centerY     = stripStartY + panelH / 2 + int(offsetY);
+
+    int stripOffset = (stripCount - 1 - strip) * samplesPerStrip;
+    int startIdx    = (writeHead - stripOffset - samplesPerStrip + bufferSize) % bufferSize;
+
+    strokeWeight(1.8);
+    stroke(COL_SIGNAL);
+    noFill();
+
+    for (int i = 0; i < samplesPerStrip - 1; i++) {
+      int idx0 = (startIdx + i)     % bufferSize;
+      int idx1 = (startIdx + i + 1) % bufferSize;
+
+      float y0 = centerY - ecgBuffer[idx0] * ampScale;
+      float y1 = centerY - ecgBuffer[idx1] * ampScale;
+
+      y0 = constrain(y0, stripStartY + 4, stripStartY + panelH - 4);
+      y1 = constrain(y1, stripStartY + 4, stripStartY + panelH - 4);
+
+      line(i, y0, i + 1, y1);
     }
 
-    wasBelow = false;
+    // Etiqueta franja
+    fill(COL_DIM);
+    noStroke();
+    textFont(fontSmall);
+    textAlign(LEFT, TOP);
+    String label = (strip == 0) ? "II  X1" :
+                   (strip == 1) ? "aVR X1" :
+                   (strip == 2) ? "aVF X1" : "PLETH";
+    text(label, 6, stripStartY + 5);
 
-    Serial.print(filtered);
-    Serial.print(",");
-    Serial.print(bpm);
-    Serial.println(",LATIDO");
+    // Etiquetas ondas P, QRS, T en franja 0
+    if (strip == 0 && waveLabelTimer > 0) {
+      int sweepX = writeHead % samplesPerStrip;
+      drawWaveLabels(sweepX, centerY, ampScale);
+      waveLabelTimer--;
+    }
 
-  } else {
-
-    Serial.print(filtered);
-    Serial.print(",");
-    Serial.print(bpm);
-    Serial.println(",OK");
+    stroke(COL_SIGNAL);
+    noFill();
   }
+}
 
-  // Reset detección
-  if (filtered < threshold) {
-    wasBelow = true;
+// ─── ETIQUETAS ONDAS ──────────────────────────────────────────────────
+void drawWaveLabels(int sx, int cy, float ampScale) {
+  // Etiquetas aproximadas relativas al cabezal de barrido
+  noStroke();
+  textFont(fontSmall);
+
+  // P — ~80ms antes del QRS (a 250Hz = ~20 muestras)
+  fill(COL_WAVE_P);
+  textAlign(CENTER, BOTTOM);
+  text("P", max(0, sx - 50), cy - int(peakAmplitude * ampScale * 0.3) - 5);
+
+  // QRS — en el pico
+  fill(COL_WAVE_Q);
+  text("QRS", max(0, sx - 15), cy - int(peakAmplitude * ampScale) - 8);
+
+  // T — ~120ms después (~30 muestras)
+  fill(COL_WAVE_T);
+  text("T", min(panelW - 10, sx + 40), cy - int(peakAmplitude * ampScale * 0.4) - 5);
+}
+
+// ─── LÍNEA DE BARRIDO ─────────────────────────────────────────────────
+void drawSweepLine() {
+  int sweepX = writeHead % samplesPerStrip;
+  stroke(0, 0, 0, 200);
+  strokeWeight(12);
+  line(sweepX, 0, sweepX, height);
+  stroke(COL_ACCENT);
+  strokeWeight(1);
+  line(sweepX, 0, sweepX, height);
+}
+
+// ─── PANEL DERECHO ────────────────────────────────────────────────────
+void drawRightPanel() {
+  int px = panelW;
+  int pw = width - panelW;
+  int margin = 14;
+  int cx = px + margin;
+  int cy = 20;
+
+  fill(COL_PANEL_BG);
+  noStroke();
+  rect(px, 0, pw, height);
+
+  stroke(COL_ACCENT);
+  strokeWeight(2);
+  line(px, 0, px, height);
+
+  // ECG label
+  fill(COL_ACCENT);
+  textFont(fontMono);
+  textAlign(LEFT, TOP);
+  text("ECG  \u2665", cx, cy); cy += 22;
+
+  // BPM
+  textFont(fontBig);
+  fill(bpmSmooth > 100 ? COL_WARN : bpmSmooth < 60 ? COL_WARN : COL_ACCENT);
+  String bpmStr = (bpmSmooth > 0) ? nf(int(bpmSmooth), 2) : "--";
+  text(bpmStr, cx, cy); cy += 85;
+
+  fill(COL_DIM);
+  textFont(fontSmall);
+  text("bpm", cx, cy); cy += 20;
+
+  divider(cx, cy, pw, margin); cy += 12;
+
+  // Ritmo
+  textFont(fontMono);
+  fill(diagColor);
+  text(rhythmStatus, cx, cy); cy += 18;
+  fill(diagColor);
+  text(diagnosis, cx, cy); cy += 24;
+
+  divider(cx, cy, pw, margin); cy += 12;
+
+  // HRV
+  fill(COL_DIM);
+  textFont(fontSmall);
+  text("─ HRV ANALYSIS ─", cx, cy); cy += 16;
+
+  fill(COL_ACCENT);
+  text("SDNN  : " + nf(sdnn,  1, 1) + " ms", cx, cy); cy += 15;
+  text("RMSSD : " + nf(rmssd, 1, 1) + " ms", cx, cy); cy += 15;
+  text("Latidos: " + beatCount,               cx, cy); cy += 15;
+  text("Muestras RR: " + rrList.size(),       cx, cy); cy += 18;
+
+  fill(sdnn < 20 ? COL_WARN : sdnn > 100 ? COL_WARN : COL_ACCENT);
+  text(hrvStatus, cx, cy); cy += 22;
+
+  divider(cx, cy, pw, margin); cy += 12;
+
+  // Barras HRV
+  fill(COL_DIM);
+  text("─ MARCADORES HRV ─", cx, cy); cy += 16;
+
+  drawBar(cx, cy, pw - margin*2, 12, sdnn  / 150.0, "SDNN",  sdnn  < 20 ? COL_WARN : COL_ACCENT); cy += 28;
+  drawBar(cx, cy, pw - margin*2, 12, rmssd / 100.0, "RMSSD", rmssd < 15 ? COL_WARN : COL_ACCENT); cy += 32;
+
+  // Ondas detectadas
+  divider(cx, cy, pw, margin); cy += 12;
+  fill(COL_DIM);
+  text("─ ONDAS ECG ─", cx, cy); cy += 16;
+
+  fill(COL_WAVE_P); text("P  onda: presente", cx, cy); cy += 14;
+  fill(COL_WAVE_Q); text("QRS pico: " + nf(peakAmplitude, 1, 1), cx, cy); cy += 14;
+  fill(COL_WAVE_T); text("T  onda: estimada", cx, cy); cy += 22;
+
+  // Nota TDAH
+  divider(cx, cy, pw, margin); cy += 12;
+  fill(COL_DIM);
+  text("─ INDICADORES TDAH ─", cx, cy); cy += 14;
+  fill(sdnn < 30 ? COL_WARN : COL_DIM);
+  text("SDNN < 30ms = alerta",  cx, cy); cy += 14;
+  fill(rmssd < 20 ? COL_WARN : COL_DIM);
+  text("RMSSD < 20ms = alerta", cx, cy); cy += 22;
+
+  // Controles
+  divider(cx, cy, pw, margin); cy += 12;
+  fill(COL_DIM);
+  text("[+][-] zoom vertical",  cx, cy); cy += 14;
+  text("[up][dn] mover senal",  cx, cy); cy += 14;
+  text("[S] guardar CSV",       cx, cy); cy += 14;
+  text("[R] reset analisis",    cx, cy); cy += 14;
+
+  // Timestamp
+  fill(COL_DIM);
+  text(hour() + ":" + nf(minute(),2) + ":" + nf(second(),2) +
+       "  Gain:" + nf(gain,1,1) + "x", cx, height - 16);
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────
+void divider(int cx, int cy, int pw, int margin) {
+  stroke(COL_GRID_L);
+  strokeWeight(1);
+  line(cx, cy, panelW + pw - margin, cy);
+}
+
+void drawBar(int x, int y, int w, int h, float pct, String label, color c) {
+  pct = constrain(pct, 0, 1);
+  fill(COL_GRID_S); noStroke();
+  rect(x, y + 14, w, h, 2);
+  fill(c);
+  rect(x, y + 14, int(w * pct), h, 2);
+  fill(COL_DIM);
+  textFont(fontSmall);
+  textAlign(LEFT, TOP);
+  text(label, x, y);
+}
+
+// ─── TOP BAR ──────────────────────────────────────────────────────────
+void drawTopBar() {
+  fill(COL_DIM);
+  textFont(fontSmall);
+  textAlign(LEFT, TOP);
+  text("Speed: 25 mm/sec   Gain: " + nf(gain,1,1) + "x   F 0.5-150 Hz", 6, height - 16);
+
+  textAlign(CENTER, TOP);
+  for (int x = gridLarge; x < panelW; x += gridLarge) {
+    if (x % (gridLarge * 5) == 0) {
+      float timeS = x / 25.0 * mmPerPx * 10;
+      text(nf(timeS,1,1) + "s", x, 2);
+    }
   }
+}
+
+// ─── FLASH LATIDO ─────────────────────────────────────────────────────
+void drawHeartFlash() {
+  if (flashTimer > 0) {
+    fill(COL_HEART, map(flashTimer, 0, 8, 0, 150));
+    noStroke();
+    ellipse(panelW + (width - panelW) / 2, 55, 28, 28);
+    flashTimer--;
+  }
+}
+
+// ─── SERIAL ───────────────────────────────────────────────────────────
+void serialEvent(Serial p) {
+  String data = p.readStringUntil('\n');
+  if (data != null) {
+    try {
+      float v = float(trim(data));
+      if (!Float.isNaN(v)) buffer.add(v);
+    } catch(Exception e) {}
+  }
+}
+
+// ─── TECLADO ──────────────────────────────────────────────────────────
+void keyPressed() {
+  if (key == '+' || key == '=') gain = constrain(gain + 0.25, 0.5, 20);
+  if (key == '-')               gain = constrain(gain - 0.25, 0.5, 20);
+  if (keyCode == UP)   offsetY = constrain(offsetY - 10, -panelH/2+20, panelH/2-20);
+  if (keyCode == DOWN) offsetY = constrain(offsetY + 10, -panelH/2+20, panelH/2-20);
+  if (key == 'r' || key == 'R') {
+    rrList.clear();
+    bpm = 0; bpmSmooth = 0; sdnn = 0; rmssd = 0;
+    beatCount = 0; peakAmplitude = 0;
+    diagnosis = "Analizando...";
+    hrvStatus = "Calculando HRV...";
+    rhythmStatus = "Ritmo: --";
+    println("Reset completo");
+  }
+  if (key == 's' || key == 'S') {
+    writer.flush();
+    writer.close();
+    println("CSV guardado: ecg_data.csv");
+  }
+}
+
+void exit() {
+  if (writer != null) { writer.flush(); writer.close(); }
+  super.exit();
 }
