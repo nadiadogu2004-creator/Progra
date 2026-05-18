@@ -1,1 +1,78 @@
+// =====================================================
+// PROYECTO ECG + HRV + AD8232
+// CÓDIGO PARA ARDUINO IDE
+// =====================================================
+// FUNCIÓN GENERAL:
+// 1. Lee la señal analógica del AD8232 desde A0.
+// 2. Toma pequeñas muestras para reducir ruido.
+// 3. Envía los datos por Serial hacia Processing.
+// 4. Mantiene una frecuencia de muestreo aproximada de 250 Hz.
+// =====================================================
 
+
+// =====================================================
+// 1. PIN DEL SENSOR ECG
+// =====================================================
+// SIGNAL_OUT del AD8232 debe ir conectado a A0.
+#define ECG_PIN A0
+
+
+// =====================================================
+// 2. CONFIGURACIÓN DE MUESTREO
+// =====================================================
+// 4000 microsegundos = 0.004 segundos
+// 1 / 0.004 = 250 muestras por segundo
+const unsigned long SAMPLE_PERIOD_US = 4000;
+
+unsigned long lastSampleUs = 0;
+
+
+// =====================================================
+// 3. CONFIGURACIÓN INICIAL
+// =====================================================
+// Se inicia la comunicación serial a 115200 baudios.
+// Processing debe usar la misma velocidad.
+void setup() {
+  Serial.begin(115200);
+}
+
+
+// =====================================================
+// 4. BUCLE PRINCIPAL
+// =====================================================
+// Lee la señal cada 4000 microsegundos.
+void loop() {
+  unsigned long now = micros();
+
+  if (now - lastSampleUs >= SAMPLE_PERIOD_US) {
+    lastSampleUs += SAMPLE_PERIOD_US;
+
+
+    // =====================================================
+    // 5. PROMEDIO DE LECTURA
+    // =====================================================
+    // N = 2 ayuda a reducir ruido sin deformar demasiado la señal.
+    // Si pones N muy alto, la señal se suaviza demasiado.
+    long acc = 0;
+    const int N = 2;
+
+    for (int i = 0; i < N; i++) {
+      acc += analogRead(ECG_PIN);
+    }
+
+    int raw = acc / N;
+
+
+    // =====================================================
+    // 6. ENVÍO SERIAL A PROCESSING
+    // =====================================================
+    // Se envía en formato:
+    // raw,leadOff
+    //
+    // leadOff se manda siempre como 0 porque en este proyecto
+    // se ignoran los pines LO+ y LO- para evitar falsos errores.
+    Serial.print(raw);
+    Serial.print(",");
+    Serial.println(0);
+  }
+}
