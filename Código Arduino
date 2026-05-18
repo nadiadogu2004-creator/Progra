@@ -1,13 +1,51 @@
+// =====================================================
+// PROYECTO ECG + HRV + TDAH EXPLORATORIO
+// CÓDIGO PARA PROCESSING 4
+// =====================================================
+//
+// FUNCIÓN GENERAL:
+// 1. Recibe la señal ECG desde Arduino.
+// 2. Elimina línea base.
+// 3. Aplica filtro notch 60 Hz.
+// 4. Genera una señal visual ECG más limpia.
+// 5. Genera una señal especial para detectar QRS.
+// 6. Detecta picos R.
+// 7. Calcula BPM, RR, SDNN, RMSSD, pNN50 y SQI.
+// 8. Guarda datos en CSV.
+// 9. Muestra una interfaz tipo monitor ECG.
+//
+// =====================================================
+
+
+// =====================================================
+// 1. LIBRERÍAS
+// =====================================================
 import processing.serial.*;
 import java.util.*;
 
+
+// =====================================================
+// 2. COMUNICACIÓN SERIAL Y ARCHIVOS
+// =====================================================
 Serial myPort;
 LinkedList<String> serialQueue = new LinkedList<String>();
 PrintWriter writer;
 
+
+// =====================================================
+// 3. CONFIGURACIÓN GENERAL DE MUESTREO
+// =====================================================
+// FS = frecuencia de muestreo.
+// Debe coincidir con Arduino: 250 Hz.
 final int FS = 250;
+
+// Frecuencia de ruido eléctrico en México: 60 Hz.
 final int LINE_FREQ = 60;
 
+
+// =====================================================
+// 4. VARIABLES DE INTERFAZ VISUAL
+// =====================================================
 int panelW;
 int sideX;
 
@@ -18,22 +56,51 @@ float yOffset = 0;
 float visualRange = 45.0;
 float manualGain = 0.55;
 
+
+// =====================================================
+// 5. VARIABLES DE ENTRADA SERIAL
+// =====================================================
 String portName = "SIN PUERTO";
 
 float rawAdc = 512;
 boolean leadOff = false;
 
+
+// =====================================================
+// 6. VARIABLES DE PROCESAMIENTO DE SEÑAL
+// =====================================================
+// baseline: línea base de la señal.
+// hp: señal centrada sin línea base.
+// notchOut: señal después del filtro notch.
+// ecg: señal limpia para visualización.
+// ecgPrev: muestra anterior usada para derivada.
 float baseline = 512;
 float hp = 0;
 float notchOut = 0;
 float ecg = 0;
 float ecgPrev = 0;
 
+
+// =====================================================
+// 7. FILTROS DIGITALES
+// =====================================================
+// notch: elimina ruido de 60 Hz.
+// lowpassECG: suaviza la señal visual.
+// qrsBandHigh + qrsBandLow: aíslan la banda QRS.
 Biquad notch;
 Biquad lowpassECG;
 Biquad qrsBandHigh;
 Biquad qrsBandLow;
 
+
+// =====================================================
+// 8. VARIABLES DEL DETECTOR QRS
+// =====================================================
+// deriv: diferencia entre muestras.
+// energy: energía de la derivada.
+// mwi: ventana móvil integradora.
+// spki/npki: estimación de señal y ruido.
+// threshold: umbral adaptativo.
 float deriv = 0;
 float energy = 0;
 
@@ -54,6 +121,10 @@ int lastRSample = -999999;
 
 int flashFrames = 0;
 
+
+// =====================================================
+// 9. BPM Y HRV
+// =====================================================
 float bpm = 0;
 float bpmSmooth = 0;
 
@@ -69,12 +140,25 @@ float rmssd = 0;
 float pnn50 = 0;
 float sqi = 0;
 
+
+// =====================================================
+// 10. ESTADOS DEL PROYECTO
+// =====================================================
 String signalStatus = "CALIBRANDO";
 String tdahProfile = "Esperando señal estable";
 String experimentState = "REPOSO";
 
+
+// =====================================================
+// 11. FUENTE VISUAL
+// =====================================================
 PFont fontMain;
 
+
+// =====================================================
+// 12. SETUP
+// =====================================================
+// Inicializa pantalla, filtros, puerto serial y archivo CSV.
 void setup() {
   fullScreen(P2D);
   smooth(4);
@@ -85,21 +169,45 @@ void setup() {
   trace = new float[panelW];
   mwiBuf = new float[mwiN];
 
+
+  // =====================================================
+  // 12.1 FILTRO NOTCH 60 Hz
+  // =====================================================
+  // Reduce ruido de la red eléctrica.
   notch = new Biquad();
   notch.setNotch(60, FS, 25.0);
 
+
+  // =====================================================
+  // 12.2 FILTRO PASA BAJAS PARA VISUALIZACIÓN ECG
+  // =====================================================
+  // Deja una señal visual más limpia.
   lowpassECG = new Biquad();
   lowpassECG.setLowpass(35, FS, 0.707);
 
+
+  // =====================================================
+  // 12.3 FILTRO PASA ALTAS Y PASA BAJAS PARA QRS
+  // =====================================================
+  // Banda aproximada 5–18 Hz.
+  // Ayuda a detectar mejor el pico R.
   qrsBandHigh = new Biquad();
   qrsBandHigh.setHighpass(5, FS, 0.707);
 
   qrsBandLow = new Biquad();
   qrsBandLow.setLowpass(18, FS, 0.707);
 
+
+  // =====================================================
+  // 12.4 FUENTE
+  // =====================================================
   fontMain = createFont("Consolas", 16, true);
   textFont(fontMain);
 
+
+  // =====================================================
+  // 12.5 PUERTO SERIAL
+  // =====================================================
   println("Puertos disponibles:");
   printArray(Serial.list());
 
@@ -119,10 +227,19 @@ void setup() {
     println("Usando puerto: " + portName);
   }
 
+
+  // =====================================================
+  // 12.6 ARCHIVO CSV
+  // =====================================================
   writer = createWriter("ecg_tdah_pro.csv");
   writer.println("time_ms,state,raw,leadOff,ecg,bpm,rr,sdnn,rmssd,pnn50,sqi,signalStatus,tdahProfile");
 }
 
+
+// =====================================================
+// 13. DRAW PRINCIPAL
+// =====================================================
+// Procesa datos seriales y dibuja el monitor.
 void draw() {
   while (!serialQueue.isEmpty()) {
     processLine(serialQueue.removeFirst());
@@ -135,6 +252,12 @@ void draw() {
   }
 }
 
+
+// =====================================================
+// 14. LECTURA DE LÍNEA SERIAL
+// =====================================================
+// Recibe datos en formato:
+// raw,leadOff
 void processLine(String line) {
   line = trim(line);
   if (line.length() == 0) return;
@@ -144,35 +267,79 @@ void processLine(String line) {
 
   try {
     rawAdc = float(parts[0]);
+
+    // Se ignora leadOff para evitar falsos positivos.
     leadOff = false;
+
     processSample(rawAdc);
   }
   catch(Exception e) {
   }
 }
 
+
+// =====================================================
+// 15. PROCESAMIENTO DE CADA MUESTRA
+// =====================================================
+// Aquí ocurre la limpieza de señal, visualización y detección.
 void processSample(float raw) {
   sampleIndex++;
 
+
+  // =====================================================
+  // 15.1 ELIMINACIÓN DE LÍNEA BASE
+  // =====================================================
+  // La línea base se adapta lentamente.
+  // Luego se resta del raw para centrar la señal.
   baseline = 0.9985 * baseline + 0.0015 * raw;
   hp = raw - baseline;
 
+
+  // =====================================================
+  // 15.2 FILTRO NOTCH
+  // =====================================================
+  // Elimina ruido cercano a 60 Hz.
   notchOut = notch.process(hp);
 
+
+  // =====================================================
+  // 15.3 SEÑAL VISUAL ECG
+  // =====================================================
+  // Se usa para dibujar el ECG en pantalla.
   float ecgVisual = lowpassECG.process(notchOut);
   ecg = 0.85 * ecg + 0.15 * ecgVisual;
 
+
+  // =====================================================
+  // 15.4 SEÑAL PARA DETECCIÓN QRS
+  // =====================================================
+  // Se filtra entre 5 y 18 Hz para resaltar el QRS.
   float qrsSignal = qrsBandHigh.process(notchOut);
   qrsSignal = qrsBandLow.process(qrsSignal);
 
+
+  // =====================================================
+  // 15.5 ACTUALIZAR VISUALIZACIÓN
+  // =====================================================
   updateVisualScale(ecg);
   pushTrace(ecg);
 
+
+  // =====================================================
+  // 15.6 DERIVADA Y ENERGÍA
+  // =====================================================
+  // La derivada resalta cambios rápidos.
+  // La energía ayuda a detectar el QRS.
   deriv = qrsSignal - ecgPrev;
   ecgPrev = qrsSignal;
 
   energy = deriv * deriv;
 
+
+  // =====================================================
+  // 15.7 VENTANA MÓVIL INTEGRADORA
+  // =====================================================
+  // Integra la energía durante 120 ms.
   mwiSum -= mwiBuf[mwiIdx];
   mwiBuf[mwiIdx] = energy;
   mwiSum += energy;
@@ -181,8 +348,16 @@ void processSample(float raw) {
 
   mwi = mwiSum / mwiN;
 
+
+  // =====================================================
+  // 15.8 DETECCIÓN QRS
+  // =====================================================
   detectQRS();
 
+
+  // =====================================================
+  // 15.9 GUARDADO CSV
+  // =====================================================
   if (writer != null) {
     writer.println(
       millis() + "," +
@@ -202,16 +377,28 @@ void processSample(float raw) {
   }
 }
 
+
+// =====================================================
+// 16. ESCALA VISUAL AUTOMÁTICA
+// =====================================================
 void updateVisualScale(float v) {
   visualRange = 0.9995 * visualRange + 0.0005 * max(abs(v), 8.0);
   visualRange = constrain(visualRange, 30.0, 120.0);
 }
 
+
+// =====================================================
+// 17. BUFFER DE LA SEÑAL
+// =====================================================
 void pushTrace(float v) {
   trace[traceHead] = v;
   traceHead = (traceHead + 1) % trace.length;
 }
 
+
+// =====================================================
+// 18. DETECCIÓN QRS
+// =====================================================
 void detectQRS() {
   if (sampleIndex < FS * 3) {
     npki = 0.995 * npki + 0.005 * mwi;
@@ -225,6 +412,10 @@ void detectQRS() {
     return;
   }
 
+
+  // =====================================================
+  // 18.1 DETECCIÓN DE PICO LOCAL
+  // =====================================================
   boolean localPeak =
     mwiPrev > mwiPrev2 &&
     mwiPrev > mwi &&
@@ -232,8 +423,14 @@ void detectQRS() {
 
   int candidateSample = sampleIndex - int(mwiN / 2);
 
+
+  // =====================================================
+  // 18.2 PERIODO REFRACTARIO
+  // =====================================================
+  // Evita contar dos picos demasiado cercanos.
   boolean refractory =
     (candidateSample - lastRSample) > int(0.62 * FS);
+
 
   if (localPeak && refractory) {
 
@@ -246,9 +443,20 @@ void detectQRS() {
 
       int rrMs = int((candidateSample - lastRSample) * 1000.0 / FS);
 
+
+      // =====================================================
+      // 18.3 RANGO RR VÁLIDO
+      // =====================================================
+      // 620 ms = 97 bpm aprox.
+      // 1500 ms = 40 bpm aprox.
       boolean rangeOK = rrMs >= 620 && rrMs <= 1500;
       boolean medianOK = true;
 
+
+      // =====================================================
+      // 18.4 FILTRO POR MEDIANA
+      // =====================================================
+      // Rechaza cambios muy bruscos respecto al ritmo previo.
       if (rrList.size() >= 5) {
         float med = medianInt(rrList);
         float limit = max(180.0, med * 0.24);
@@ -258,6 +466,10 @@ void detectQRS() {
         }
       }
 
+
+      // =====================================================
+      // 18.5 LATIDO ACEPTADO
+      // =====================================================
       if (rangeOK && medianOK) {
         rrList.add(rrMs);
 
@@ -292,9 +504,17 @@ void detectQRS() {
     npki = 0.01 * mwi + 0.99 * npki;
   }
 
+
+  // =====================================================
+  // 18.6 UMBRAL ADAPTATIVO
+  // =====================================================
   threshold = npki + 0.28 * (spki - npki);
   threshold = max(threshold, 0.008);
 
+
+  // =====================================================
+  // 18.7 RECALIBRACIÓN SI SE PIERDE LA SEÑAL
+  // =====================================================
   if (lastRSample > 0 && (sampleIndex - lastRSample) > int(2.5 * FS)) {
     spki = 0.03;
     npki = 0.005;
@@ -306,6 +526,10 @@ void detectQRS() {
   mwiPrev = mwi;
 }
 
+
+// =====================================================
+// 19. CÁLCULO HRV
+// =====================================================
 void calculateHRV() {
   if (rrList.size() < 8) return;
 
@@ -321,6 +545,10 @@ void calculateHRV() {
 
   rrMean /= clean.size();
 
+
+  // =====================================================
+  // 19.1 SDNN
+  // =====================================================
   float s = 0;
 
   for (int rr : clean) {
@@ -329,6 +557,10 @@ void calculateHRV() {
 
   sdnn = sqrt(s / max(clean.size() - 1, 1));
 
+
+  // =====================================================
+  // 19.2 RMSSD Y pNN50
+  // =====================================================
   float diffSum = 0;
   int count = 0;
   int over50 = 0;
@@ -350,6 +582,11 @@ void calculateHRV() {
   rmssd = sqrt(diffSum / max(count, 1));
   pnn50 = 100.0 * over50 / max(count, 1);
 
+
+  // =====================================================
+  // 19.3 SQI
+  // =====================================================
+  // Calidad aproximada de señal.
   float total = goodBeats + rejectedBeats;
 
   if (rrList.size() < 10) {
@@ -359,6 +596,10 @@ void calculateHRV() {
   }
 }
 
+
+// =====================================================
+// 20. LIMPIEZA DE RR
+// =====================================================
 ArrayList<Integer> cleanRR(ArrayList<Integer> rr) {
   ArrayList<Integer> out = new ArrayList<Integer>();
 
@@ -379,6 +620,10 @@ ArrayList<Integer> cleanRR(ArrayList<Integer> rr) {
   return out;
 }
 
+
+// =====================================================
+// 21. MEDIANA
+// =====================================================
 float medianInt(ArrayList<Integer> list) {
   ArrayList<Integer> tmp = new ArrayList<Integer>(list);
   Collections.sort(tmp);
@@ -396,6 +641,10 @@ float medianInt(ArrayList<Integer> list) {
   return 0.5 * (tmp.get(n / 2 - 1) + tmp.get(n / 2));
 }
 
+
+// =====================================================
+// 22. ESTADO FISIOLÓGICO EXPLORATORIO
+// =====================================================
 void updateStates() {
   if (rrList.size() < 10) {
     signalStatus = "CALIBRANDO";
@@ -430,6 +679,10 @@ void updateStates() {
   }
 }
 
+
+// =====================================================
+// 23. DIBUJO GENERAL DEL MONITOR
+// =====================================================
 void drawMonitor() {
   background(0, 10, 0);
 
@@ -438,6 +691,10 @@ void drawMonitor() {
   drawSidePanel();
 }
 
+
+// =====================================================
+// 24. CUADRÍCULA ECG
+// =====================================================
 void drawGrid() {
   strokeWeight(1);
 
@@ -463,12 +720,20 @@ void drawGrid() {
   line(panelW, 0, panelW, height);
 }
 
+
+// =====================================================
+// 25. DIBUJO DE LA SEÑAL ECG
+// =====================================================
 void drawTrace() {
   float centerY = height * 0.52 + yOffset;
   float amp = height * 0.18 * manualGain;
 
   noFill();
 
+
+  // =====================================================
+  // 25.1 BRILLO DE LA SEÑAL
+  // =====================================================
   stroke(0, 255, 80, 25);
   strokeWeight(6);
   beginShape();
@@ -487,6 +752,10 @@ void drawTrace() {
 
   endShape();
 
+
+  // =====================================================
+  // 25.2 LÍNEA ECG PRINCIPAL
+  // =====================================================
   stroke(80, 255, 160);
   strokeWeight(1.8);
   beginShape();
@@ -505,6 +774,10 @@ void drawTrace() {
 
   endShape();
 
+
+  // =====================================================
+  // 25.3 LÍNEA DE BARRIDO
+  // =====================================================
   int sweepX = traceHead % panelW;
 
   stroke(120, 255, 200, 100);
@@ -518,6 +791,10 @@ void drawTrace() {
     flashFrames--;
   }
 
+
+  // =====================================================
+  // 25.4 TEXTO SUPERIOR
+  // =====================================================
   fill(130, 255, 180);
   textAlign(LEFT, TOP);
 
@@ -529,10 +806,18 @@ void drawTrace() {
   text("Estado experimental: " + experimentState, 16, 52);
 }
 
+
+// =====================================================
+// 26. LIMITADOR SIMPLE
+// =====================================================
 float softClip(float x) {
   return constrain(x, -1.8, 1.8);
 }
 
+
+// =====================================================
+// 27. PANEL DERECHO
+// =====================================================
 void drawSidePanel() {
   noStroke();
   fill(0, 18, 0);
@@ -628,6 +913,10 @@ void drawSidePanel() {
   text("R reset  S imagen  G CSV", x, y);
 }
 
+
+// =====================================================
+// 28. TEXTO DEL PANEL
+// =====================================================
 void drawLabelValue(int x, int y, String label, String value) {
   fill(70, 210, 120);
   textSize(13);
@@ -638,6 +927,10 @@ void drawLabelValue(int x, int y, String label, String value) {
   text(value, x, y + 14);
 }
 
+
+// =====================================================
+// 29. GRÁFICA PEQUEÑA DE BPM
+// =====================================================
 void drawBpmTrend(int x, int y, int w, int h) {
   noFill();
 
@@ -665,6 +958,10 @@ void drawBpmTrend(int x, int y, int w, int h) {
   endShape();
 }
 
+
+// =====================================================
+// 30. OBTENER ÚLTIMO RR
+// =====================================================
 int getLastRR() {
   if (rrList.size() == 0) {
     return 0;
@@ -673,6 +970,10 @@ int getLastRR() {
   return rrList.get(rrList.size() - 1);
 }
 
+
+// =====================================================
+// 31. EVENTO SERIAL
+// =====================================================
 void serialEvent(Serial p) {
   String data = p.readStringUntil('\n');
 
@@ -685,6 +986,10 @@ void serialEvent(Serial p) {
   }
 }
 
+
+// =====================================================
+// 32. CONTROLES DE TECLADO
+// =====================================================
 void keyPressed() {
   if (key == '+' || key == '=') {
     manualGain += 0.10;
@@ -737,6 +1042,10 @@ void keyPressed() {
   }
 }
 
+
+// =====================================================
+// 33. RESET DEL ANÁLISIS
+// =====================================================
 void resetAnalysis() {
   rrList.clear();
   bpmTrend.clear();
@@ -762,6 +1071,10 @@ void resetAnalysis() {
   tdahProfile = "Esperando señal estable";
 }
 
+
+// =====================================================
+// 34. SALIDA DEL PROGRAMA
+// =====================================================
 void exit() {
   if (writer != null) {
     writer.flush();
@@ -771,6 +1084,11 @@ void exit() {
   super.exit();
 }
 
+
+// =====================================================
+// 35. CLASE BIQUAD
+// =====================================================
+// Permite crear filtros notch, pasa bajas y pasa altas.
 class Biquad {
   float b0, b1, b2, a1, a2;
   float x1 = 0;
@@ -778,6 +1096,10 @@ class Biquad {
   float y1 = 0;
   float y2 = 0;
 
+
+  // =====================================================
+  // 35.1 FILTRO NOTCH
+  // =====================================================
   void setNotch(float f0, float fs, float Q) {
     float w0 = TWO_PI * f0 / fs;
     float cosw0 = cos(w0);
@@ -798,6 +1120,10 @@ class Biquad {
     a2 = aa2 / aa0;
   }
 
+
+  // =====================================================
+  // 35.2 FILTRO PASA BAJAS
+  // =====================================================
   void setLowpass(float f0, float fs, float Q) {
     float w0 = TWO_PI * f0 / fs;
     float cosw0 = cos(w0);
@@ -819,6 +1145,10 @@ class Biquad {
     a2 = aa2 / aa0;
   }
 
+
+  // =====================================================
+  // 35.3 FILTRO PASA ALTAS
+  // =====================================================
   void setHighpass(float f0, float fs, float Q) {
     float w0 = TWO_PI * f0 / fs;
     float cosw0 = cos(w0);
@@ -840,6 +1170,10 @@ class Biquad {
     a2 = aa2 / aa0;
   }
 
+
+  // =====================================================
+  // 35.4 PROCESAMIENTO DEL FILTRO
+  // =====================================================
   float process(float x) {
     float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
 
